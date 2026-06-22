@@ -1,15 +1,13 @@
 import time
+import requests
 from langchain_community.llms import Ollama
 from langchain_core.prompts import PromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 
 class LLMGenerator:
     def __init__(self):
-        # Hardware constraint applied: Using 3B parameter model for 4GB VRAM limit
         self.llm = Ollama(model="llama3.2", temperature=0.0)
         
-        # REQ-05: Strict Prompt Wrapper
-        # Upgraded Enterprise-Grade Grounded Generation Prompt (REQ-04 & REQ-05)
         self.prompt = PromptTemplate.from_template("""
 SYSTEM ROLE:
 You are an expert, strict Corporate Policy Assistant operating in STRICT FACTUAL MODE. Your primary objective is to produce highly accurate, grounded, and verifiable responses using only the provided context. Accuracy overrides creativity, speed, or completeness.
@@ -28,8 +26,32 @@ Question: {question}
 Answer:""")
         self.chain = self.prompt | self.llm | StrOutputParser()
 
+        self.rewriter_prompt = PromptTemplate.from_template("""
+Given the following chat history and a follow-up question, rewrite the follow-up question into a standalone question that can be searched in a database. Do NOT explain anything, just output the rewritten question in one sentence.
+
+Chat History:
+{chat_history}
+
+Follow-up Question: {question}
+Standalone Question:""")
+        self.rewriter_chain = self.rewriter_prompt | self.llm | StrOutputParser()
+
+    def rewrite_query(self, query, chat_history):
+        if not chat_history:
+            return query
+        
+        history_str = ""
+        for msg in chat_history[-3:]:
+            history_str += f"{msg['role'].capitalize()}: {msg['content']}\n"
+            
+        try:
+            rewritten_query = self.rewriter_chain.invoke({"chat_history": history_str, "question": query})
+            return rewritten_query.strip()
+        except Exception as e:
+            # If Ollama is offline, raise a readable exception rather than throwing a traceback
+            raise RuntimeError("Ollama background service is offline. Please make sure Ollama is open in your taskbar tray.")
+
     def generate_response(self, query, retrieved_docs_with_scores):
-        """Generates AI answer and formats citation payload."""
         context_blocks, citations_payload = [], []
         
         for doc, score in retrieved_docs_with_scores:
@@ -43,7 +65,11 @@ Answer:""")
         unified_context = "\n---\n".join(context_blocks)
 
         start_time = time.time()
-        ai_response = self.chain.invoke({"context": unified_context, "question": query})
+        try:
+            ai_response = self.chain.invoke({"context": unified_context, "question": query})
+        except Exception as e:
+            raise RuntimeError("Ollama background service is offline. Please make sure Ollama is open in your taskbar tray.")
+            
         latency = time.time() - start_time
 
         return ai_response, citations_payload, latency
