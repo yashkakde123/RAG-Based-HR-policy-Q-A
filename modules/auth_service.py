@@ -1,53 +1,64 @@
-import requests
-import firebase_admin
-from firebase_admin import credentials, auth as admin_auth
-import streamlit as st
+import os
+import json
+import hashlib
 
-class FirebaseAuthService:
-    def __init__(self):
-        # Initialize Firebase Admin SDK for backend security
-        if not firebase_admin._apps:
-            cred = credentials.Certificate("config/firebase_creds.json")
-            firebase_admin.initialize_app(cred)
-        
-        # We only need the API Key to talk to the REST API
-        self.api_key = st.secrets["firebase"]["apiKey"]
+class LocalAuthService:
+    def __init__(self, filepath="config/users.json"):
+        self.filepath = filepath
+        # Ensure the config directory exists
+        os.makedirs(os.path.dirname(self.filepath), exist_ok=True)
+        # Initialize JSON database file if it doesn't exist yet
+        if not os.path.exists(self.filepath):
+            with open(self.filepath, "w") as f:
+                json.dump({}, f)
+
+    def _hash_password(self, password):
+        """SHA-256 hashing to satisfy REQ-07 Security Standards."""
+        return hashlib.sha256(password.encode()).hexdigest()
 
     def sign_in_user(self, email, password):
-        url = f"https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key={self.api_key}"
-        payload = {"email": email, "password": password, "returnSecureToken": True}
-        try:
-            response = requests.post(url, json=payload)
-            response.raise_for_status()
-            data = response.json()
-            
-            # Use Admin SDK to verify the token is legitimate
-            decoded_token = admin_auth.verify_id_token(data['idToken'])
-            return {"success": True, "user_info": decoded_token, "idToken": data['idToken']}
-            
-        except requests.exceptions.HTTPError:
-            return {"success": False, "error": "Invalid email or password. Please try again."}
-
-    def sign_up_user(self, email, password):
-        url = f"https://identitytoolkit.googleapis.com/v1/accounts:signUp?key={self.api_key}"
-        payload = {"email": email, "password": password, "returnSecureToken": True}
-        try:
-            response = requests.post(url, json=payload)
-            response.raise_for_status()
-            return {"success": True, "msg": "User successfully registered!"}
-            
-        except requests.exceptions.HTTPError as e:
-            error_message = response.json().get("error", {}).get("message", "Registration failed.")
-            return {"success": False, "error": f"Registration failed: {error_message}"}
+        # 1. Check Hardcoded Super-Admin first (Emergency Access)
+        if email == "admin@cdac.in" and password == "admin123":
+            return {"success": True, "user_info": {"email": email, "role": "admin"}}
         
-    def reset_password(self, email):
-        """Sends a password reset email via Firebase REST API."""
-        url = f"https://identitytoolkit.googleapis.com/v1/accounts:sendOobCode?key={self.api_key}"
-        payload = {"requestType": "PASSWORD_RESET", "email": email}
+        # 2. Check Local Offline JSON Database
         try:
-            response = requests.post(url, json=payload)
-            response.raise_for_status()
-            return {"success": True, "msg": f"A password reset link has been sent to {email}."}
+            with open(self.filepath, "r") as f:
+                users = json.load(f)
             
-        except requests.exceptions.HTTPError:
-            return {"success": False, "error": "Failed to send reset email. Make sure the email is registered."}
+            hashed_pass = self._hash_password(password)
+            if email in users and users[email]["password"] == hashed_pass:
+                return {"success": True, "user_info": {"email": email, "role": users[email]["role"]}}
+            
+            return {"success": False, "error": "Invalid email or password."}
+        except Exception as e:
+            return {"success": False, "error": f"Local Directory Error: {str(e)}"}
+
+    def sign_up_user(self, email, password, invite_code):
+        # Enforce strict invitation validation (Fixes the dummy email loophole!)
+        if invite_code != "CDAC_GATE_2026":
+            return {"success": False, "error": "Invalid Corporate Invitation Passcode. Registration denied."}
+
+        # Enforce corporate domain segregation (REQ-07)
+        if not email.endswith("@cdac.in"):
+            return {"success": False, "error": "Only CDAC corporate domains (@cdac.in) are permitted."}
+        
+        try:
+            with open(self.filepath, "r") as f:
+                users = json.load(f)
+            
+            if email in users or email == "admin@cdac.in":
+                return {"success": False, "error": "This email address is already registered."}
+            
+            # Secure password hashing
+            users[email] = {
+                "password": self._hash_password(password),
+                "role": "user"
+            }
+            
+            with open(self.filepath, "w") as f:
+                json.dump(users, f, indent=4)
+                
+            return {"success": True, "msg": "User successfully registered in local database!"}
+        except Exception as e:
+            return {"success": False, "error": f"Failed to write to database: {str(e)}"}
