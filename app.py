@@ -11,9 +11,6 @@ if "user_token" not in st.session_state or st.session_state.user_token is None:
 else:
     st.set_page_config(page_title="CDAC Policy Assistant", page_icon="📂", layout="wide")
 
-# ==========================================
-# 2. INJECT ENTERPRISE CUSTOM CSS STYLING
-# ==========================================
 st.markdown("""
 <style>
     .stApp { background-color: #f8f9fa; }
@@ -34,8 +31,7 @@ st.markdown("""
         font-size: 0.88em; color: #374151;
     }
     section[data-testid="stSidebar"] { background-color: #ffffff !important; border-right: 1px solid #e5e7eb; }
-    .stButton>button { border-radius: 8px !important; font-weight: 600 !important; transition: all 0.2s ease-in-out !important; }
-    .stButton>button:hover { transform: translateY(-1px); box-shadow: 0 4px 6px -1px rgba(0,0,0,0.1); }
+    .stButton>button { border-radius: 8px !important; font-weight: 600 !important; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -52,20 +48,13 @@ except Exception as e:
 # 4. Setup Logging (REQ-08)
 logging.basicConfig(filename='admin_secure.log', level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s')
 
-# ==========================================
 # 5. STREAMLIT OPTIMIZATION: RESOURCE CACHING
-# ==========================================
 @st.cache_resource
-def get_auth_service():
-    return LocalAuthService()
-
+def get_auth_service(): return LocalAuthService()
 @st.cache_resource
-def get_vector_database():
-    return VectorDatabase()
-
+def get_vector_database(): return VectorDatabase()
 @st.cache_resource
-def get_llm_generator():
-    return LLMGenerator()
+def get_llm_generator(): return LLMGenerator()
 
 # Instantiate Cached Modules
 try:
@@ -79,21 +68,16 @@ except Exception as e:
 doc_processor = DocumentProcessor()
 
 # Init Session States
-if "user_token" not in st.session_state:
-    st.session_state.user_token = None
-if "chat_history" not in st.session_state:
-    st.session_state.chat_history = []
+if "user_token" not in st.session_state: st.session_state.user_token = None
+if "chat_history" not in st.session_state: st.session_state.chat_history = []
 
 # ==========================================
 # AUTHENTICATION PORTAL (100% LOCAL & OFFLINE)
 # ==========================================
 if st.session_state.user_token is None:
     col1, col2, col3 = st.columns([1, 6, 1])
-    
     with col2:
         st.markdown("<div class='login-container'>", unsafe_allow_html=True)
-        
-        # Branded Header
         st.markdown("<h2 style='text-align: center; color: #1e3a8a;'>🛡️ Corporate Security Gateway</h2>", unsafe_allow_html=True)
         st.markdown("<p style='text-align: center; color: #6b7280; margin-bottom: 30px;'>RAG-Based Company Policy Q&A System (Offline Mode)</p>", unsafe_allow_html=True)
         
@@ -107,7 +91,7 @@ if st.session_state.user_token is None:
             
             if st.button("Sign In", use_container_width=True, type="primary"):
                 if not login_email.strip() or not login_pass.strip():
-                    st.warning("Please fill in both email and password fields.")
+                    st.warning("Please fill in both fields.")
                 else:
                     with st.spinner("Verifying credentials locally..."):
                         time.sleep(0.5)
@@ -140,14 +124,11 @@ if st.session_state.user_token is None:
                             st.success(res["msg"])
                         else:
                             st.error(res["error"])
-        
         st.markdown("</div>", unsafe_allow_html=True)
 
 # ==========================================
-# RAG APPLICATION WORKSPACE (PHYSICALLY ISOLATED ELSE BLOCK)
+# RAG APPLICATION WORKSPACE
 # ==========================================
-# This 'else' block guarantees the app will NEVER try to read 
-# 'current_user' variables unless the user is completely logged in! [1.1.2]
 else:
     current_user = st.session_state.user_token
 
@@ -161,19 +142,54 @@ else:
         if is_admin:
             st.markdown("---")
             st.markdown("<h3 style='color: #1e3a8a;'>🔧 Admin Workspace</h3>", unsafe_allow_html=True)
-            st.caption("Ingest and update corporate policy documents.")
+            
+            # SECURE DOCUMENT UPLOADER WIDGET
+            st.markdown("##### 📤 Upload Policy PDFs")
+            uploaded_files = st.file_uploader(
+                "Drag and drop or select files:", 
+                type=["pdf"], 
+                accept_multiple_files=True,
+                key="policy_uploader"
+            )
+            
+            if uploaded_files:
+                doc_dir = "data/documents"
+                os.makedirs(doc_dir, exist_ok=True) 
+                uploaded_count = 0
+                
+                for uploaded_file in uploaded_files:
+                    target_path = os.path.join(doc_dir, uploaded_file.name)
+                    file_exists = os.path.exists(target_path)
+                    
+                    try:
+                        with open(target_path, "wb") as f:
+                            f.write(uploaded_file.getbuffer())
+                        
+                        if file_exists:
+                            st.info(f"🔄 Updated/Overwrote existing file: `{uploaded_file.name}`")
+                        else:
+                            st.success(f"📥 Saved new file: `{uploaded_file.name}`")
+                            
+                        uploaded_count += 1
+                    except Exception as e:
+                        st.error(f"Failed to save {uploaded_file.name}: {str(e)}")
+                
+                if uploaded_count > 0:
+                    st.caption("👉 Click 'Trigger Ingestion Pipeline' below to index changes.")
+            
+            st.markdown("---")
+            st.caption("Click to index newly uploaded documents.")
             
             if st.button("Trigger Ingestion Pipeline", use_container_width=True, type="primary"):
                 try:
-                    with st.spinner("Reading, cleaning PII, chunking, and embedding PDFs..."):
+                    with st.spinner("Scanning directory, applying PII masking, chunking, and embedding new PDFs..."):
                         chunks = doc_processor.extract_and_chunk()
-                        count = vector_db.save_chunks_to_db(chunks)
-                        
-                        if count > 0:
-                            st.success(f"Pipeline Executed! Indexed {count} semantic blocks.")
-                            logging.info(f"Admin {current_user['email']} indexed {count} blocks.")
+                        if chunks:
+                            count = vector_db.save_chunks_to_db(chunks)
+                            st.success(f"Pipeline Executed! Indexed {count} new semantic blocks.")
+                            logging.info(f"Admin {current_user['email']} indexed {count} new blocks.")
                         else:
-                            st.warning("No PDFs found in data/documents/")
+                            st.info("No new or modified documents detected. Database is up to date.")
                 except Exception as e:
                     st.error(f"Ingestion Pipeline Failed: {str(e)}")
                     logging.error(f"Ingestion crashed: {str(e)}")
@@ -197,10 +213,8 @@ else:
         avatar = "👤" if interaction["role"] == "user" else "🤖"
         with st.chat_message(interaction["role"], avatar=avatar):
             st.markdown(interaction["content"])
-            
             if "latency" in interaction:
                 st.markdown(f"<p style='color: #9ca3af; font-size: 0.8em; margin-top: 5px; text-align: right;'>⚡ Processing Latency: {interaction['latency']:.2f}s</p>", unsafe_allow_html=True)
-                
             if interaction["role"] == "assistant" and "citations" in interaction:
                 for cit in interaction["citations"]:
                     st.markdown(f"""
@@ -216,7 +230,6 @@ else:
             st.markdown(user_query)
         st.session_state.chat_history.append({"role": "user", "content": user_query})
 
-        # Retrieve from DB Module safely
         if not os.path.exists("./chroma_db") or not os.listdir("./chroma_db"):
             st.error("Vector database is empty. Admin must trigger Ingestion first.")
         else:
@@ -226,21 +239,22 @@ else:
                     search_query = llm_gen.rewrite_query(user_query, st.session_state.chat_history[:-1])
                     logging.info(f"Query: '{user_query}' | Contextualized Search Term: '{search_query}'")
 
-                # 2. Retrieve Context
-                retrieved_docs_with_scores, ret_latency = vector_db.retrieve_context_hybrid(search_query)
-                best_score = retrieved_docs_with_scores[0][1] if retrieved_docs_with_scores else 9.9
+                # 2. Retrieve Context (Returns real absolute best distance score)
+                retrieved_docs_with_scores, ret_latency, absolute_best_distance = vector_db.retrieve_context_hybrid(search_query)
                 
                 with st.chat_message("assistant", avatar="🤖"):
                     # 3. Apply relevance thresholding
-                    if best_score > 1.15:
+                    if absolute_best_distance > 1.15:
                         ai_response = "I do not know."
                         st.markdown(ai_response)
                         total_time = ret_latency
                     else:
-                        with st.spinner("Analyzing corporate policy and formulating answer..."):
-                            ai_response, citations, gen_latency = llm_gen.generate_response(user_query, retrieved_docs_with_scores)
+                        # 4. Invoke LLM and stream response
+                        stream_generator, citations = llm_gen.generate_response_stream(user_query, retrieved_docs_with_scores)
                         
-                        st.markdown(ai_response)
+                        start_gen_time = time.time()
+                        ai_response = st.write_stream(stream_generator)
+                        gen_latency = time.time() - start_gen_time
                         
                         if "I do not know" not in ai_response:
                             for cit in citations:
@@ -259,7 +273,7 @@ else:
                     
                     # Store in history
                     history_entry = {"role": "assistant", "content": ai_response, "latency": total_time}
-                    if "I do not know" not in ai_response and best_score <= 1.15:
+                    if "I do not know" not in ai_response and absolute_best_distance <= 1.15:
                         history_entry["citations"] = citations
                     st.session_state.chat_history.append(history_entry)
                     
