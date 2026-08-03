@@ -8,56 +8,84 @@ from langchain_core.documents import Document
 class VectorDatabase:
     def __init__(self, db_path="./chroma_db"):
         self.db_path = db_path
-        # Fixes M1: Swapped to BGE-Small and forced CPU device to save GPU VRAM
-        # Changed from "cpu" to "cuda"
-        self.embedding_model = HuggingFaceEmbeddings(
-            model_name="BAAI/bge-small-en-v1.5",
-            model_kwargs={"device": "cpu"}
-        )
+        
+        # DECLARE IMMEDIATELY: Prevents attribute errors during startup
+        self.vector_db = None
+        self.bm25_retriever = None
+        
+        # REQ-02: Initializing the bge-base-en-v1.5 model (768 dimensions)
+        self.embedding_model = HuggingFaceEmbeddings(model_name="BAAI/bge-base-en-v1.5")
+        self._load_db()
+
+    def _load_db(self):
+        """Loads database connections and caches both Chroma and BM25 search indexes in memory."""
+        if os.path.exists(self.db_path) and os.listdir(self.db_path):
+            self.vector_db = Chroma(
+                persist_directory=self.db_path, 
+                embedding_function=self.embedding_model
+            )
+            
+            # Extract stored documents to construct and cache the BM25 index
+            stored_data = self.vector_db.get()
+            if stored_data and stored_data.get("documents"):
+                doc_list = []
+                for text, meta in zip(stored_data["documents"], stored_data["metadatas"]):
+                    doc_list.append(Document(page_content=text, metadata=meta))
+                
+                # Cache the BM25 retriever instance
+                self.bm25_retriever = BM25Retriever.from_documents(doc_list)
+            else:
+                self.bm25_retriever = None
+        else:
+            self.vector_db = None
+            self.bm25_retriever = None
 
     def save_chunks_to_db(self, chunks):
-        """Initializes ChromaDB and saves the vectorized chunks."""
+        """Appends new chunks to the database and automatically updates the cached indexes."""
         if not chunks:
             return 0
         
-        documents = [
-            Document(page_content=c["text"], metadata=c["metadata"]) 
-            for c in chunks
-        ]
+        texts = [c["text"] for c in chunks]
+        metadatas = [c["metadata"] for c in chunks]
+
+        if self.vector_db is None:
+            self.vector_db = Chroma.from_texts(
+                texts=texts,
+                embedding=self.embedding_model,
+                metadatas=metadatas,
+                persist_directory=self.db_path
+            )
+        else:
+            self.vector_db.add_texts(texts=texts, metadatas=metadatas)
         
-        vector_db = Chroma.from_documents(
-            documents=documents,
-            embedding=self.embedding_model,
-            persist_directory=self.db_path
-        )
+        # Refresh the cached database and BM25 index on the fly
+        self._load_db()
         return len(chunks)
 
     def retrieve_context_hybrid(self, query, top_k=3):
-        """Fixes M3: Fuses Dense Vector Search and Lexical BM25 Search using a 
-        custom, robust Reciprocal Rank Fusion (RRF) algorithm.
+        """Retrieves matching chunks utilizing a manual Reciprocal Rank Fusion (BM25 + Semantic).
+        OPTIMIZED: Uses In-Memory caching to achieve < 5s latency.
         """
-        if not os.path.exists(self.db_path) or not os.listdir(self.db_path):
-            return None, 0.0
+        # 1. Use the CACHED databases (Bypasses disk I/O for instant retrieval)
+        if self.vector_db is None:
+            self._load_db()
+            if self.vector_db is None:
+                return [], 0.0, 9.9
 
-        vector_db = Chroma(persist_directory=self.db_path, embedding_function=self.embedding_model)
-        
         start_time = time.time()
         
-        all_data = vector_db.get()
-        if not all_data or not all_data['documents']:
-            return None, 0.0
+        # 2. Fetch from cached Vector Database
+        vector_docs_with_scores = self.vector_db.similarity_search_with_score(query, k=top_k * 2)
+        
+        # Capture absolute best distance for the security guardrail in app.py
+        absolute_best_distance = vector_docs_with_scores[0][1] if vector_docs_with_scores else 9.9
+        
+        # 3. Fetch from cached BM25 Database
+        bm25_docs = []
+        if self.bm25_retriever is not None:
+            self.bm25_retriever.k = top_k * 2
+            bm25_docs = self.bm25_retriever.invoke(query)
             
-        langchain_docs = [
-            Document(page_content=text, metadata=meta) 
-            for text, meta in zip(all_data['documents'], all_data['metadatas'])
-        ]
-        
-        bm25_retriever = BM25Retriever.from_documents(langchain_docs)
-        bm25_retriever.k = top_k * 2 
-        bm25_docs = bm25_retriever.invoke(query)
-        
-        vector_docs_with_scores = vector_db.similarity_search_with_score(query, k=top_k * 2)
-        
         latency = time.time() - start_time
         
         # ==========================================
@@ -70,14 +98,14 @@ class VectorDatabase:
         for rank, (doc, score) in enumerate(vector_docs_with_scores, 1):
             content = doc.page_content
             doc_map[content] = doc
-            scores_map[content] = score
+            scores_map[content] = score  # Preserves your real Chroma score!
             rrf_scores[content] = rrf_scores.get(content, 0) + 1.0 / (60 + rank)
             
         for rank, doc in enumerate(bm25_docs, 1):
             content = doc.page_content
             doc_map[content] = doc
             if content not in scores_map:
-                scores_map[content] = 0.80
+                scores_map[content] = 0.80  # Fallback for keyword-only matches
             rrf_scores[content] = rrf_scores.get(content, 0) + 1.0 / (60 + rank)
             
         sorted_contents = sorted(rrf_scores, key=rrf_scores.get, reverse=True)
@@ -86,4 +114,5 @@ class VectorDatabase:
         for content in sorted_contents[:top_k]:
             fused_docs_with_scores.append((doc_map[content], scores_map[content]))
             
-        return fused_docs_with_scores, latency
+        # Returns 3 variables to match our updated app.py logic
+        return fused_docs_with_scores, latency, absolute_best_distance
