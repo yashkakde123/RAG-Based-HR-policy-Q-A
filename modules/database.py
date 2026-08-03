@@ -5,6 +5,9 @@ from langchain_community.vectorstores import Chroma
 from langchain_community.retrievers import BM25Retriever
 from langchain_core.documents import Document
 
+# Import CrossEncoder from sentence-transformers (already in your env)
+from sentence_transformers import CrossEncoder
+
 class VectorDatabase:
     def __init__(self, db_path="./chroma_db"):
         self.db_path = db_path
@@ -15,6 +18,11 @@ class VectorDatabase:
         
         # REQ-02: Initializing the bge-base-en-v1.5 model (768 dimensions)
         self.embedding_model = HuggingFaceEmbeddings(model_name="BAAI/bge-base-en-v1.5")
+        
+        # NEW: Load local lightweight Cross-Encoder (~270MB model)
+        # It automatically downloads on the first run, then operates 100% offline
+        self.reranker = CrossEncoder("BAAI/bge-reranker-base")
+        
         self._load_db()
 
     def _load_db(self):
@@ -63,10 +71,9 @@ class VectorDatabase:
         return len(chunks)
 
     def retrieve_context_hybrid(self, query, top_k=3):
-        """Retrieves matching chunks utilizing a manual Reciprocal Rank Fusion (BM25 + Semantic).
-        OPTIMIZED: Uses In-Memory caching to achieve < 5s latency.
+        """Retrieves matching chunks utilizing a manual Reciprocal Rank Fusion (BM25 + Semantic)
+        and refines the ranking using a Cross-Encoder Reranker.
         """
-        # 1. Use the CACHED databases (Bypasses disk I/O for instant retrieval)
         if self.vector_db is None:
             self._load_db()
             if self.vector_db is None:
@@ -74,45 +81,67 @@ class VectorDatabase:
 
         start_time = time.time()
         
-        # 2. Fetch from cached Vector Database
-        vector_docs_with_scores = self.vector_db.similarity_search_with_score(query, k=top_k * 2)
+        # Stage 1: Gather a slightly larger pool of candidates (e.g., top_k * 3) for the reranker
+        candidate_count = top_k * 3
+        vector_results = self.vector_db.similarity_search_with_score(query, k=candidate_count)
         
-        # Capture absolute best distance for the security guardrail in app.py
-        absolute_best_distance = vector_docs_with_scores[0][1] if vector_docs_with_scores else 9.9
-        
-        # 3. Fetch from cached BM25 Database
+        # Capture the absolute closest distance for our security threshold in app.py
+        absolute_best_distance = vector_results[0][1] if vector_results else 9.9
+        vector_docs = [res[0] for res in vector_results]
+
+        # Fetch candidates from BM25
         bm25_docs = []
         if self.bm25_retriever is not None:
-            self.bm25_retriever.k = top_k * 2
+            self.bm25_retriever.k = candidate_count
             bm25_docs = self.bm25_retriever.invoke(query)
             
-        latency = time.time() - start_time
-        
-        # ==========================================
-        # CUSTOM RECIPROCAL RANK FUSION (RRF)
-        # ==========================================
+        # Apply Reciprocal Rank Fusion (RRF) to merge duplicates and compile candidates
+        c = 60
         rrf_scores = {}
         doc_map = {}      
-        scores_map = {}   
         
-        for rank, (doc, score) in enumerate(vector_docs_with_scores, 1):
+        for rank, (doc, score) in enumerate(vector_results, 1):
             content = doc.page_content
             doc_map[content] = doc
-            scores_map[content] = score  # Preserves your real Chroma score!
             rrf_scores[content] = rrf_scores.get(content, 0) + 1.0 / (60 + rank)
             
         for rank, doc in enumerate(bm25_docs, 1):
             content = doc.page_content
             doc_map[content] = doc
-            if content not in scores_map:
-                scores_map[content] = 0.80  # Fallback for keyword-only matches
             rrf_scores[content] = rrf_scores.get(content, 0) + 1.0 / (60 + rank)
             
         sorted_contents = sorted(rrf_scores, key=rrf_scores.get, reverse=True)
         
+        # Compile the top candidate pool (e.g., top 10 unique documents)
+        candidate_pool = [doc_map[content] for content in sorted_contents[:candidate_count]]
+        
+        # ==========================================
+        # STAGE 2: CROSS-ENCODER RERANKING
+        # ==========================================
         fused_docs_with_scores = []
-        for content in sorted_contents[:top_k]:
-            fused_docs_with_scores.append((doc_map[content], scores_map[content]))
+        
+        if candidate_pool and self.reranker is not None:
+            # Pair each candidate text with the user query
+            pairs = [[query, doc.page_content] for doc in candidate_pool]
             
-        # Returns 3 variables to match our updated app.py logic
+            # Predict similarity scores (higher is more relevant)
+            rerank_scores = self.reranker.predict(pairs)
+            
+            # Map candidate documents to their new cross-encoder scores
+            reranked_docs = []
+            for doc, score in zip(candidate_pool, rerank_scores):
+                reranked_docs.append((doc, float(score)))
+                
+            # Sort strictly by the cross-encoder's score (descending)
+            reranked_docs.sort(key=lambda x: x[1], reverse=True)
+            
+            # Take the top_k best documents
+            fused_docs_with_scores = reranked_docs[:top_k]
+        else:
+            # Fallback if no candidates are found or if the reranker fails
+            for content in sorted_contents[:top_k]:
+                fused_docs_with_scores.append((doc_map[content], 0.80))
+                
+        latency = time.time() - start_time
+        
         return fused_docs_with_scores, latency, absolute_best_distance
