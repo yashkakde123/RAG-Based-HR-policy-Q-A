@@ -108,8 +108,20 @@ if st.session_state.user_token is None:
                             st.rerun()
                         else:
                             # ---- Admin login diagnostic (helps on Streamlit Cloud) ----
-                            diag = auth_service.admin_credentials_detected()
-                            if login_email == auth_service.admin_email:
+                            # Guarded with getattr so a stale/out-of-sync auth_service
+                            # (method missing on the deployed copy) can never crash the app.
+                            diag_fn = getattr(auth_service, "admin_credentials_detected", None)
+                            if callable(diag_fn):
+                                diag = diag_fn()
+                            else:
+                                diag = {
+                                    "admin_email_loaded": bool(getattr(auth_service, "admin_email", None)),
+                                    "admin_password_loaded": bool(getattr(auth_service, "admin_password", None)),
+                                    "invite_code_loaded": bool(getattr(auth_service, "invite_code", None)),
+                                    "source": "diagnostic unavailable (stale auth_service deployed)",
+                                }
+                            admin_email = getattr(auth_service, "admin_email", None)
+                            if login_email == admin_email:
                                 if not (diag["admin_email_loaded"] and diag["admin_password_loaded"]):
                                     st.error(
                                         "⚠️ Admin credentials are NOT loaded on this server. "
