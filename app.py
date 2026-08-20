@@ -98,11 +98,31 @@ if st.session_state.user_token is None:
                         res = auth_service.sign_in_user(login_email, login_pass)
                         if res["success"]:
                             st.session_state.user_token = res["user_info"]
+                            # Timestamped audit record for the admin log file (REQ-08)
+                            if res["user_info"]["role"] == "admin":
+                                logging.info(f"ADMIN SIGNIN | {login_email} | registered_at: {res['user_info'].get('registered_at', '-')}")
+                            else:
+                                logging.info(f"USER SIGNIN | {login_email} | registered_at: {res['user_info'].get('registered_at', '-')}")
                             st.success("Identity Verified. Loading System Components...")
                             time.sleep(1)
                             st.rerun()
                         else:
-                            st.error(res["error"])
+                            # ---- Admin login diagnostic (helps on Streamlit Cloud) ----
+                            diag = auth_service.admin_credentials_detected()
+                            if login_email == auth_service.admin_email:
+                                if not (diag["admin_email_loaded"] and diag["admin_password_loaded"]):
+                                    st.error(
+                                        "⚠️ Admin credentials are NOT loaded on this server. "
+                                        "Streamlit Cloud does not read the repo's .streamlit/secrets.toml. "
+                                        "Paste the [admin] section into: App → ⋮ → Settings → Secrets, "
+                                        "then Save and Restart the app."
+                                    )
+                                    logging.error(f"Admin login blocked - credentials source: {diag['source']}")
+                                else:
+                                    st.error("Invalid admin password. Check the admin_password set in Streamlit Secrets.")
+                                    logging.error("Admin login failed (password mismatch) despite credentials being loaded.")
+                            else:
+                                st.error(res["error"])
                             
         with tab2:
             st.markdown("<br>", unsafe_allow_html=True)
@@ -122,6 +142,7 @@ if st.session_state.user_token is None:
                         res = auth_service.sign_up_user(reg_email, reg_pass, invite_code)
                         if res["success"]:
                             st.success(res["msg"])
+                            logging.info(f"NEW REGISTRATION | {reg_email} | role: user")
                         else:
                             st.error(res["error"])
         st.markdown("</div>", unsafe_allow_html=True)
@@ -135,7 +156,9 @@ else:
     # Sidebar workspace management
     with st.sidebar:
         st.markdown("<h3 style='color: #1e3a8a;'>👤 User Session</h3>", unsafe_allow_html=True)
-        st.info(f"**Logged In:**\n{current_user['email']}\n\n**Role:** {current_user['role'].capitalize()}")
+        st.info(f"**Logged In:**\n{current_user['email']}\n\n**Role:** {current_user['role'].capitalize()}\n\n"
+                f"**Registered:** {current_user.get('registered_at', '-')}\n"
+                f"**Signed in:** {current_user.get('login_at', '-')}")
         
         # REQ-07: Offline Role Segregation & Admin Panel Access Gate
         is_admin = current_user['role'] == "admin"
@@ -193,7 +216,47 @@ else:
                 except Exception as e:
                     st.error(f"Ingestion Pipeline Failed: {str(e)}")
                     logging.error(f"Ingestion crashed: {str(e)}")
-                    
+
+                # ==========================================
+            # ADMIN DASHBOARD: VIEW USERS & ACTIVITY LOGS
+            # ==========================================
+            st.markdown("---")
+            st.markdown("##### 👥 Registered Users")
+            users_result = auth_service.list_users()
+            if users_result["ok"]:
+                if users_result["users"]:
+                    st.dataframe(users_result["users"], use_container_width=True, hide_index=True)
+                    st.caption(f"Total: {len(users_result['users'])} registered user(s)")
+                    users_csv = ("email,role\n" + "\n".join(
+                        f"{u['email']},{u['role']}"
+                        for u in users_result["users"]
+                    ))
+                    st.download_button(
+                        "⬇️ Download registered users (CSV)",
+                        users_csv,
+                        file_name="registered_users.csv",
+                        key="dl_users",
+                    )
+                else:
+                    st.caption("No users registered yet.")
+            else:
+                st.error(f"Could not read users database: {users_result['error']}")
+
+            with st.expander("🕵️ Admin Activity Logs"):
+                log_result = auth_service.read_log_file(max_lines=300)
+                if log_result["ok"]:
+                    st.code(log_result["log"] or "(empty log so far)")
+                    st.download_button(
+                        "⬇️ Download full log",
+                        log_result["log"],
+                        file_name="admin_secure.log",
+                        key="dl_log",
+                    )
+                else:
+                    st.info(log_result["error"])
+                st.caption("⚠️ Streamlit Cloud restarts wipe runtime files. "
+                           "Download reports before a restart, or move storage to a cloud DB/Sheets.")
+
         st.markdown("---")
         if st.button("Secure Sign-Out", use_container_width=True):
             st.session_state.user_token = None
