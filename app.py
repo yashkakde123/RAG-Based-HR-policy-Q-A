@@ -135,6 +135,17 @@ if st.session_state.user_token is None:
                                     logging.error("Admin login failed (password mismatch) despite credentials being loaded.")
                             else:
                                 st.error(res["error"])
+                                # ---- TEMPORARY: Cloud admin-secret diagnostic (remove after fixing) ----
+                                with st.expander("🔎 [TEMP] Admin secret check"):
+                                    st.json({
+                                        "typed_email_repr": repr(login_email),
+                                        "admin_email_repr": repr(admin_email),
+                                        "exact_email_match": login_email == admin_email,
+                                        "admin_email_loaded": diag["admin_email_loaded"],
+                                        "admin_password_loaded": diag["admin_password_loaded"],
+                                        "secret_source": diag["source"],
+                                        "typed_password_len": len(login_pass),
+                                    })
                             
         with tab2:
             st.markdown("<br>", unsafe_allow_html=True)
